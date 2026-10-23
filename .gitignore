@@ -1,0 +1,10 @@
+# 构建产物
+build/
+authcore/
+frameworks/
+overlaybuild/
+YOLOiOSApp/Resources/
+YOLOiOSApp.xcodeproj/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Load filter for MobileSubstrate-compatible loaders (ElleKit on Dopamine,
+	  Substitute on palera1n, Substrate on checkra1n/unc0ver).
+
+	  ONLY SpringBoard. That is the whole design:
+	    * no game is ever injected - one install covers every app;
+	    * SpringBoard is never suspended, which is why its window stays above
+	      whatever app is in the foreground;
+	    * the app process keeps loading its own embedded copy from Frameworks/,
+	      so the integrity surface there is unchanged.
+
+	  This file must sit next to AuthCore.dylib with the same base name: loaders
+	  pair "X.plist" with "X.dylib" in the same directory.
+	-->
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.springboard</string>
+		</array>
+	</dict>
+</dict>
+</plist>

@@ -1,0 +1,528 @@
+name: Build YOLO Person iOS (unsigned IPA + Core ML models)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      bundle_lite_llm:
+        description: 'Bundle the Lite GGUF (~1GB) into the IPA'
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # ---------- llama.cpp XCFramework ----------
+      # Pinned: the C API changes between builds, so the framework must match
+      # the Swift code (e.g. use_mmap -> load_mode).
+      - name: Fetch llama.cpp XCFramework
+        run: |
+          chmod +x scripts/fetch-llama.sh
+          ./scripts/fetch-llama.sh
+
+      # ---------- 1. Export Core ML models ----------
+      - name: Install ultralytics & coremltools
+        run: |
+          python -m pip install --upgrade pip
+          pip install ultralytics coremltools \
+            || pip install -i https://pypi.tuna.tsinghua.edu.cn/simple ultralytics coremltools
+
+      - name: Export Core ML models
+        run: |
+          python - <<'PY'
+          from ultralytics import YOLO
+          import os, shutil
+
+          targets = [
+              ("yolo11s.pt", "yolo11s", 640),
+              ("yolo11m.pt", "yolo11m", 640),
+              ("yolov8n.pt", "yolov8n", 640),
+          ]
+          for weights, name, imgsz in targets:
+              print(f"=== exporting {weights} -> {name}.mlpackage ===")
+              m = YOLO(weights)
+              m.export(format="coreml", imgsz=imgsz, nms=False)
+              stem = weights.rsplit(".", 1)[0]
+              src, dst = f"{stem}.mlpackage", f"{name}.mlpackage"
+              if os.path.isdir(src) and src != dst:
+                  if os.path.isdir(dst):
+                      shutil.rmtree(dst)
+                  os.rename(src, dst)
+              print(f"  -> {dst}: {os.path.isdir(dst)}")
+          PY
+          ls -la *.mlpackage || true
+
+      - name: Precompile models to .mlmodelc
+        run: |
+          set -e
+          XC=$(xcrun --find coremlcompiler)
+          mkdir -p compiled
+          for pkg in *.mlpackage; do
+            [ -d "$pkg" ] || continue
+            "$XC" compile "$pkg" compiled/ || echo "::warning::compile failed for $pkg"
+          done
+          ls -la compiled/ || true
+
+      # Only kept when the build fails.
+      #
+      # These are ~219 MB per run and they are already baked into the IPA, so
+      # uploading them on success burned the entire 512 MB plan quota (usage had
+      # reached 9497 MB). They are useful only for diagnosing an export failure.
+      - name: Upload Core ML models (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coreml-models-failed
+          path: |
+            *.mlpackage
+            compiled/*.mlmodelc
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Stage bundled model into app resources
+        run: |
+          set -e
+          mkdir -p YOLOiOSApp/Resources
+          if [ -d compiled/yolo11s.mlmodelc ]; then
+            cp -R compiled/yolo11s.mlmodelc YOLOiOSApp/Resources/
+            echo "bundled: yolo11s.mlmodelc"
+          elif [ -d compiled/yolov8n.mlmodelc ]; then
+            cp -R compiled/yolov8n.mlmodelc YOLOiOSApp/Resources/
+            echo "bundled: yolov8n.mlmodelc (fallback)"
+          else
+            echo "::warning::no compiled model available to bundle"
+          fi
+          ls -la YOLOiOSApp/Resources || true
+
+      # ---------- Optional: bundle the Lite chat model ----------
+      # Off by default: it adds ~1GB to the IPA, which makes every test install
+      # slow. Turn it on for a release build via workflow_dispatch.
+      - name: Bundle Lite GGUF (optional)
+        if: ${{ inputs.bundle_lite_llm }}
+        run: |
+          set -e
+          URL="https://hf-mirror.com/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+          echo "downloading Lite GGUF from hf-mirror..."
+          curl -fL --retry 3 --connect-timeout 30 -o /tmp/lite.gguf "$URL"
+          ls -lh /tmp/lite.gguf
+          cp /tmp/lite.gguf YOLOiOSApp/Resources/qwen2.5-1.5b-instruct-q4_k_m.gguf
+
+      # ---------- 2. Generate Xcode project ----------
+      - name: Install XcodeGen
+        run: brew install xcodegen || brew install xcodegen
+
+      # ---------- AuthCore: the authorization dylib + overlay engine ----------
+      # Compiled here rather than fetched, so the checks embedded in it always
+      # match the source in this commit.
+      #
+      # ONE BINARY, TWO HOSTS. The same file is
+      #   * embedded in the app (Frameworks/AuthCore.dylib, @rpath) for the
+      #     integrity surface, and
+      #   * packaged by the .deb into /usr/lib, where a filter pointing at
+      #     com.apple.springboard makes SpringBoard load it and run the overlay.
+      # The overlay has to run in SpringBoard: an app-owned window is composited
+      # only inside its own process, which is exactly why the overlay used to
+      # disappear on app switch.
+      #
+      # Output goes to authcore/ rather than build/: the xcodebuild below uses
+      # `-derivedDataPath build`, which owns that whole tree and would clobber
+      # anything placed inside it.
+      - name: Build AuthCore dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p authcore
+
+          ENGINE=""
+          for f in YOLOiOSApp/OverlayEngine/*.m; do
+            [ -f "$f" ] || { echo "::error::no overlay engine sources found"; exit 1; }
+            ENGINE="$ENGINE $f"
+          done
+          echo "engine sources:$ENGINE"
+
+          # arm64e as well as arm64: SpringBoard on A12 and newer runs arm64e and
+          # an arm64-only slice cannot be injected there.
+          #
+          # -mios-version-min is NOT optional. Without it clang stamps the SDK's
+          # default minimum into LC_BUILD_VERSION, and dyld on iOS 15/16/17 then
+          # refuses to load the dylib - silently, which reads on device as
+          # "component not installed". The step below asserts the stamped value.
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -arch arm64e \
+            -isysroot "$SDK" \
+            -mios-version-min=15.0 \
+            -dynamiclib \
+            -fobjc-arc \
+            -O2 \
+            -fno-common \
+            -I YOLOiOSApp \
+            -install_name @rpath/AuthCore.dylib \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Security \
+            -framework CoreML \
+            -framework CoreVideo \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -o authcore/AuthCore.dylib \
+            YOLOiOSApp/AuthCore.m \
+            $ENGINE
+
+          echo "--- produced ---"
+          file authcore/AuthCore.dylib
+          SIZE=$(stat -f%z authcore/AuthCore.dylib)
+          echo "size=$SIZE bytes"
+          if [ "$SIZE" -lt 20000 ]; then
+            echo "::error::AuthCore.dylib is suspiciously small ($SIZE bytes)"
+            exit 1
+          fi
+
+          # The load-ability check. A too-high minos is the one build mistake that
+          # cannot be caught any other way: the binary builds, the symbols are all
+          # there, and it simply refuses to load on every supported OS.
+          echo "--- LC_BUILD_VERSION ---"
+          xcrun vtool -show-build authcore/AuthCore.dylib
+          MINOS_VALUES=$(xcrun vtool -show-build authcore/AuthCore.dylib \
+                         | awk '/minos/ {print $2}' | sort -u)
+          echo "minos values: $MINOS_VALUES"
+          if [ -z "$MINOS_VALUES" ]; then
+            echo "::error::no LC_BUILD_VERSION / minos found in the dylib"
+            exit 1
+          fi
+          for MINOS in $MINOS_VALUES; do
+            MAJOR=${MINOS%%.*}
+            if [ "$MAJOR" -gt 15 ]; then
+              echo "::error::minos $MINOS is above 15.0; dyld will refuse to load this on iOS 15 and reports nothing"
+              exit 1
+            fi
+          done
+          echo "OK: minos <= 15.0 on every slice"
+
+          echo "--- architectures ---"
+          lipo -info authcore/AuthCore.dylib
+          for ARCH in arm64 arm64e; do
+            if ! lipo -info authcore/AuthCore.dylib | grep -q "$ARCH"; then
+              echo "::error::missing $ARCH slice; injection fails on that CPU family"
+              exit 1
+            fi
+          done
+
+          # --- symbol tables, captured once ---
+          #
+          # Dumped to files rather than piped into `grep -q`: with `pipefail` on,
+          # grep exiting at the first match closes the pipe and nm dies with
+          # "LLVM ERROR: IO failure on output stream: Broken pipe", which makes
+          # the whole pipeline look like a failed assertion.
+          NM_ALL=/tmp/nm_all.txt
+          NM_GLOB=/tmp/nm_glob.txt
+          NM_UNDEF=/tmp/nm_undef.txt
+          xcrun nm -a  authcore/AuthCore.dylib > "$NM_ALL"   2>/dev/null || true
+          xcrun nm -gU authcore/AuthCore.dylib > "$NM_GLOB"  2>/dev/null || true
+          xcrun nm -u  authcore/AuthCore.dylib > "$NM_UNDEF" 2>/dev/null || true
+          echo "symbols: $(wc -l < "$NM_ALL") total, $(wc -l < "$NM_GLOB") global"
+
+          # The app calls exactly these four. A missing one makes the bridge
+          # silently report "dylib absent", which is hard to diagnose on device.
+          echo "--- app-facing entry points ---"
+          FAIL=0
+          for SYM in AuthCoreIsLoaded AuthCoreVersion AuthCoreIntegritySummary AuthCoreVerifyIntegrity; do
+            if grep -q "_$SYM\$" "$NM_GLOB"; then
+              echo "  OK   _$SYM"
+            else
+              echo "::error::missing entry point _$SYM"
+              FAIL=1
+            fi
+          done
+
+          # The component surface. These are what tell the app whether the deb is
+          # actually installed and running - AuthCoreIsLoaded only speaks for the
+          # copy inside the app bundle.
+          for SYM in AuthCoreSystemAvailable AuthCoreSystemHeartbeatAge \
+                     AuthCoreComponentRequired AuthCoreIsSpringBoardHost; do
+            if grep -q "_$SYM\$" "$NM_GLOB"; then
+              echo "  OK   _$SYM"
+            else
+              echo "::error::missing component entry point _$SYM"
+              FAIL=1
+            fi
+          done
+
+          # The dylib's own card check. These gate the overlay engine, so a
+          # missing symbol would silently turn the gate into "always denied".
+          for SYM in AuthCoreSubmitCard AuthCoreLicenseValid AuthCoreLicenseAge \
+                     AuthCoreLicenseLevel AuthCoreLastLicenseResult AuthCoreSyncLicense; do
+            if grep -q "_$SYM\$" "$NM_GLOB"; then
+              echo "  OK   _$SYM"
+            else
+              echo "::error::missing license entry point _$SYM"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "0" ] || exit 1
+
+          # The shared HMAC secret must not be readable with `strings`. It is a
+          # compiled constant by design, but if the plaintext is greppable then
+          # forging a signed request needs no reverse engineering at all.
+          #
+          # A hit is a warning, not a failure: this is defence in depth, and the
+          # exact byte sequence `strings` reports is not fully predictable across
+          # toolchain versions (masked bytes are themselves printable ASCII). The
+          # matching lines are printed so a real regression is obvious.
+          strings -a authcore/AuthCore.dylib > /tmp/strings.txt 2>/dev/null || true
+          echo "strings.txt: $(wc -l < /tmp/strings.txt) lines"
+          if grep -in "95cb84ae" /tmp/strings.txt | head -5; then
+            echo "::warning::license HMAC secret appears verbatim in the binary"
+          else
+            echo "OK: license secret is masked"
+          fi
+
+          # Every engine translation unit must have contributed. A filename left
+          # out of the loop above is not a clang error, but the feature silently
+          # disappears - this catches that.
+          for SYM in YOCapture YODetector YOInjector YOWindow YOConfig YOEngine YOLicense; do
+            if grep -q "$SYM" "$NM_ALL"; then
+              echo "  OK   engine: $SYM"
+            else
+              echo "::error::engine class $SYM missing from the dylib"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "0" ] || exit 1
+
+          # Private symbols must NOT be linked: they are resolved with dlsym so a
+          # system without them degrades instead of refusing to load.
+          if grep -qE "CARenderServerRenderDisplay|IOHIDEventSystemClientDispatchEvent" "$NM_UNDEF"; then
+            echo "::error::private API is linked instead of dlsym'd"
+            grep -E "CARenderServer|IOHIDEvent" "$NM_UNDEF" || true
+            exit 1
+          fi
+          echo "OK: private entry points are resolved at runtime"
+
+          # Must be a shared library, not an object file: it is loaded at runtime
+          # both by the app and by SpringBoard.
+          if ! file authcore/AuthCore.dylib | grep -q "dynamically linked shared library"; then
+            echo "::error::AuthCore.dylib is not a dynamic library"
+            exit 1
+          fi
+          echo "AuthCore OK"
+
+      # ---------- the .deb that installs the component ----------
+      #
+      # Users install this with Sileo or `dpkg -i`. A loose dylib is a worse
+      # delivery format: the filter plist and the respring are part of "it works".
+      # make_deb.py writes the ar archive itself - macOS ar and GNU ar disagree
+      # about symbol tables and dpkg rejects a `__.SYMDEF` member - and re-reads
+      # the package to verify it.
+      #
+      # Two packages from one dylib:
+      #   _iphoneos-arm    rootful  -> /usr/lib, /Library/MobileSubstrate/...
+      #   _iphoneos-arm64  rootless -> /var/jb/usr/lib, /var/jb/Library/...
+      # The split is baked into the paths because a rootless device has a sealed
+      # system volume, so a rootful-path package cannot even unpack there.
+      - name: Build overlay deb
+        run: |
+          set -euo pipefail
+          python3 YOLOiOSApp/OverlayEngine/make_deb.py \
+            --dylib authcore/AuthCore.dylib \
+            --out authcore/debs \
+            --version 1.1.0
+
+          echo "--- packages ---"
+          ls -la authcore/debs
+
+          for DEB in authcore/debs/*.deb; do
+            echo "--- $DEB"
+            # ar magic. Checked directly rather than through `file`: the magic
+            # database differs between macOS versions.
+            if ! head -c 8 "$DEB" | grep -q '!<arch>'; then
+              echo "::error::$DEB does not start with the ar magic"
+              exit 1
+            fi
+            if ! head -c 24 "$DEB" | tail -c 16 | grep -q 'debian-binary'; then
+              echo "::error::$DEB does not begin with debian-binary"
+              exit 1
+            fi
+          done
+
+          for VARIANT in iphoneos-arm iphoneos-arm64; do
+            if [ ! -f "authcore/debs/cc.ouovo.authcore_1.1.0_${VARIANT}.deb" ]; then
+              echo "::error::missing package for $VARIANT"
+              exit 1
+            fi
+          done
+          echo "overlay deb OK"
+
+      # Short-lived and non-fatal: the Actions storage quota is shared with the
+      # IPA. A failed upload must not fail an otherwise good build.
+      - name: Upload AuthCore component
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuthCore-component
+          path: |
+            authcore/debs/*.deb
+            YOLOiOSApp/OverlayEngine/README.md
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Generate .xcodeproj
+        run: |
+          xcodegen --version
+          xcodegen generate
+          OBJ=$(grep -m1 'objectVersion' YOLOiOSApp.xcodeproj/project.pbxproj | tr -dc '0-9')
+          echo "objectVersion=$OBJ"
+          if [ "$OBJ" -gt 60 ]; then
+            echo "::warning::downgrading objectVersion $OBJ -> 60"
+            sed -i '' "s/objectVersion = $OBJ;/objectVersion = 60;/" YOLOiOSApp.xcodeproj/project.pbxproj
+          fi
+          xcodebuild -list -project YOLOiOSApp.xcodeproj
+
+      # ---------- 3. Build unsigned .app ----------
+      - name: Build unsigned app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project YOLOiOSApp.xcodeproj \
+            -scheme YOLOiOSApp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            build > /tmp/xcodebuild.log 2>&1 || true
+          grep -nE 'error:|cannot|Use of|does not conform|Undefined symbol' /tmp/xcodebuild.log | head -80 || true
+          echo "----- tail -----"
+          tail -40 /tmp/xcodebuild.log
+          if grep -qE 'error:' /tmp/xcodebuild.log; then
+            echo "::error::swift build failed"
+            exit 1
+          fi
+          if ! grep -q 'BUILD SUCCEEDED' /tmp/xcodebuild.log; then
+            echo "::error::no BUILD SUCCEEDED marker"
+            exit 1
+          fi
+
+      # Diagnostic only. If artifact storage is unavailable (quota, outage) the
+      # build must still finish and ship the IPA — losing a log is not a reason
+      # to throw away a successful compile.
+      - name: Upload build log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/xcodebuild.log
+          retention-days: 1
+          if-no-files-found: warn
+
+      # ---------- 4. Package IPA ----------
+      # llama.framework is a DYNAMIC framework. If it is not embedded, dyld
+      # aborts the app at launch with SIGABRT / "Library not loaded" *before*
+      # main() runs, which no in-process code can observe. This check exists so
+      # that failure can never reach a device again.
+      - name: Verify dynamic framework embedding
+        run: |
+          set -e
+          APP=build/Build/Products/Release-iphoneos/YOLOiOSApp.app
+          echo "--- app Frameworks/ ---"
+          ls -la "$APP/Frameworks" || { echo "::error::no Frameworks directory in the .app"; exit 1; }
+
+          if [ ! -f "$APP/Frameworks/llama.framework/llama" ]; then
+            echo "::error::llama.framework is NOT embedded - dyld will abort at launch"
+            exit 1
+          fi
+          echo "OK: llama.framework embedded"
+
+          echo "--- main binary: llama reference ---"
+          otool -L "$APP/YOLOiOSApp" | grep -i "llama" || echo "::warning::no llama link reference"
+
+          echo "--- framework install name ---"
+          otool -D "$APP/Frameworks/llama.framework/llama" || true
+
+          echo "--- rpaths on the main binary ---"
+          otool -l "$APP/YOLOiOSApp" | grep -A2 LC_RPATH || true
+
+      - name: Package IPA
+        run: |
+          APP=build/Build/Products/Release-iphoneos/YOLOiOSApp.app
+          if [ ! -d "$APP" ]; then echo "::error::app not found at $APP"; exit 1; fi
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry YOLO-Person-unsigned.ipa Payload
+          ls -lh YOLO-Person-unsigned.ipa
+
+      - name: Verify IPA contents
+        run: |
+          set -e
+          rm -rf /tmp/ipacheck && mkdir -p /tmp/ipacheck
+          unzip -q YOLO-Person-unsigned.ipa -d /tmp/ipacheck
+
+          FW=/tmp/ipacheck/Payload/YOLOiOSApp.app/Frameworks/llama.framework/llama
+          if [ ! -f "$FW" ]; then
+            echo "::error::IPA is missing Payload/YOLOiOSApp.app/Frameworks/llama.framework/llama"
+            find /tmp/ipacheck/Payload -maxdepth 3 | head -40
+            exit 1
+          fi
+          ls -lh "$FW"
+          echo "OK: IPA embeds llama.framework"
+
+          # AuthCore must be inside the IPA too. It is weak-linked, so a build
+          # that forgot to embed it would still link, launch, and quietly report
+          # no dylib — which is why this is a hard failure rather than a warning.
+          AC=/tmp/ipacheck/Payload/YOLOiOSApp.app/Frameworks/AuthCore.dylib
+          if [ ! -f "$AC" ]; then
+            echo "::error::IPA is missing Payload/YOLOiOSApp.app/Frameworks/AuthCore.dylib"
+            echo "--- Frameworks/ ---"
+            ls -la /tmp/ipacheck/Payload/YOLOiOSApp.app/Frameworks || true
+            exit 1
+          fi
+          ls -lh "$AC"
+          if ! file "$AC" | grep -q "dynamically linked shared library"; then
+            echo "::error::AuthCore.dylib in the IPA is not a dynamic library"
+            file "$AC"
+            exit 1
+          fi
+          echo "OK: IPA embeds AuthCore.dylib"
+
+          # Confirm the main binary actually references it. A dylib present but
+          # not linked is dead weight that never loads, and the app would report
+          # "no dylib" despite the file being right there in the bundle.
+          echo "--- main binary load commands ---"
+          xcrun otool -L /tmp/ipacheck/Payload/YOLOiOSApp.app/YOLOiOSApp
+          if ! xcrun otool -L /tmp/ipacheck/Payload/YOLOiOSApp.app/YOLOiOSApp \
+               | grep -q "AuthCore.dylib"; then
+            echo "::error::main binary has no AuthCore.dylib load command; it would never load"
+            exit 1
+          fi
+          echo "OK: main binary references AuthCore.dylib"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: YOLO-Person-unsigned-ipa
+          path: YOLO-Person-unsigned.ipa
+          retention-days: 7
+          if-no-files-found: error
