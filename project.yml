@@ -1,0 +1,174 @@
+name: YOLOiOSApp
+options:
+  bundleIdPrefix: com.yolo.person
+  # iOS 15.0 is the floor on purpose: the jailbreak / TrollStore devices this
+  # build targets run 15.0 - 26.0.x, and an IPA stamped 18.0 is refused by the
+  # installer on anything older. Every 16/17/18-only API is therefore either
+  # wrapped in `#available` or reimplemented below the floor - never dropped.
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "3.0.0"
+    CURRENT_PROJECT_VERSION: "30"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: ""
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "NO"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    INFOPLIST_FILE: YOLOiOSApp/Info.plist
+    GENERATE_INFOPLIST_FILE: "NO"
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    # Exposes AuthCore's C entry points to Swift. The dylib is optional, so its
+    # symbols are declared weak_import in the header and the safe wrappers in
+    # AuthCoreBridge.c gate every call.
+    SWIFT_OBJC_BRIDGING_HEADER: YOLOiOSApp/AuthCoreBridge.h
+    # llama.cpp is a C/C++ static framework; its headers need to be visible to
+    # the Swift importer, and the C++ runtime has to come along for the link.
+    CLANG_CXX_LANGUAGE_STANDARD: "gnu++17"
+    ALWAYS_SEARCH_USER_PATHS: "NO"
+targets:
+  YOLOiOSApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: YOLOiOSApp
+        excludes:
+          - "Info.plist"
+          - "Resources"
+          # Compiled separately into AuthCore.dylib. Including it here would put
+          # a second definition of every entry point in the app binary and the
+          # link would fail on duplicate symbols.
+          - "AuthCore.m"
+          # The SpringBoard half of AuthCore.dylib. It is compiled into the same
+          # dylib (see the CI `Build AuthCore dylib` step) and must never be part
+          # of the app target: two copies of these Objective-C classes - one in
+          # the app binary, one in the loaded dylib - collide at runtime, and the
+          # engine is only ever correct inside SpringBoard.
+          - "OverlayEngine"
+      # CI drops the pre-compiled recommended model here so the app works out of
+      # the box. Optional so a plain checkout without the model still generates.
+      - path: YOLOiOSApp/Resources
+        optional: true
+        buildPhase: resources
+    # llama.xcframework is a DYNAMIC framework (Mach-O MH_DYLIB, install name
+    # "@rpath/llama.framework/llama"). It must be embedded into .app/Frameworks
+    # and signed, otherwise dyld aborts at launch with SIGABRT /
+    # "Library not loaded" before main() ever runs.
+    #
+    # Verified with: python3 check_macho.py frameworks/llama.xcframework
+    #
+    # `weak: true` is required for the iOS 15 floor. The official prebuilt
+    # xcframework from llama.cpp is stamped IOS_MIN_OS_VERSION=16.4 in
+    # build-xcframework.sh (CMAKE_OSX_DEPLOYMENT_TARGET, -mios-version-min, and
+    # `vtool -set-build-version`), so on iOS 15 dyld refuses to load it and the
+    # app dies before main() — a hard link makes the whole app unusable there,
+    # not just the chat feature. Weak-linked, the app launches and LlamaEngine
+    # reports the framework as unavailable, which the UI surfaces as a disabled
+    # chat tab instead of a crash.
+    #
+    # AuthCore.dylib carries the authorization checks. It is weak-linked so the
+    # app still builds when the dylib has not been built, and the safe wrappers
+    # in AuthCoreBridge.c report "absent" at runtime instead of crashing. CI
+    # compiles it before xcodegen runs, so the shipped IPA always has it.
+    dependencies:
+      - framework: frameworks/llama.xcframework
+        embed: true
+        link: true
+        weak: true
+        codeSign: true
+    settings:
+      base:
+        # Version is set once in `settings.base` above; don't restate it here or
+        # the two copies drift.
+        PRODUCT_BUNDLE_IDENTIFIER: com.yolo.person.YOLOiOSApp
+        # The framework declares its own libc++ / Accelerate / Metal links in
+        # its modulemap, so nothing extra is needed here. The Swift runtime and
+        # SwiftUI are linked automatically by Xcode.
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
+        # `-weak_library` marks every symbol in AuthCore as a weak reference, so
+        # a build without the file still links. The header's `weak_import`
+        # attributes and the NULL checks in AuthCoreBridge.c complete the story:
+        # without the dylib the app runs, and simply reports no dylib.
+        OTHER_LDFLAGS: "$(inherited) -weak_library $(SRCROOT)/authcore/AuthCore.dylib"
+    # Runs before compilation. `-weak_library` still requires the path to exist:
+    # the linker errors on a missing file even though every symbol in it is weak.
+    # A stub is generated so a local build without the dylib links, and CI (which
+    # compiles the real one first) never hits this path.
+    preBuildScripts:
+      - name: Ensure AuthCore exists
+        script: |
+          set -e
+          DYLIB="${SRCROOT}/authcore/AuthCore.dylib"
+          if [ -f "$DYLIB" ]; then
+            echo "AuthCore.dylib present ($(stat -f%z "$DYLIB") bytes)"
+            exit 0
+          fi
+          echo "note: AuthCore.dylib absent; generating a stub so the link succeeds"
+          mkdir -p "$(dirname "$DYLIB")"
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          # An empty but well-formed dynamic library: weak references to it all
+          # resolve to NULL at runtime, which is exactly the "dylib absent" case
+          # the bridge handles.
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -install_name @rpath/AuthCore.dylib \
+            -o "$DYLIB" \
+            -x c /dev/null
+          echo "stub created: $(stat -f%z "$DYLIB") bytes"
+        basedOnDependencyAnalysis: false
+    # Runs after every embedding and Swift-stdlib phase. An earlier variant put
+    # this in `postCompileScripts`, whose output later phases swept away.
+    postBuildScripts:
+      - name: Embed AuthCore
+        script: |
+          set -e
+          SRC="${SRCROOT}/authcore/AuthCore.dylib"
+          DEST="${TARGET_BUILD_DIR}/${WRAPPER_NAME}/Frameworks/AuthCore.dylib"
+          if [ ! -f "$SRC" ]; then
+            echo "note: authcore/AuthCore.dylib not present; skipping embed"
+            exit 0
+          fi
+          mkdir -p "$(dirname "$DEST")"
+          cp -f "$SRC" "$DEST"
+          chmod 755 "$DEST"
+          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && \
+             [ "${CODE_SIGNING_REQUIRED:-NO}" = "YES" ]; then
+            codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "$DEST" || true
+          fi
+          echo "embedded AuthCore.dylib -> $DEST"
+          echo "--- bundle Frameworks/ ---"
+          ls -la "$(dirname "$DEST")"
+        basedOnDependencyAnalysis: false
+      # Diagnostic only, never fails the build. The app now targets iOS 15, so
+      # every binary in the bundle has to be loadable there: an embedded
+      # framework stamped above 15.0 builds fine and then makes dyld abort at
+      # launch on the very devices this build exists for, which no other check
+      # in the pipeline would catch.
+      - name: Report deployment target of embedded binaries
+        script: |
+          set +e
+          APP="${TARGET_BUILD_DIR}/${WRAPPER_NAME}"
+          APP_MIN=$(xcrun vtool -show-build "$APP/${EXECUTABLE_NAME}" 2>/dev/null \
+                    | awk '/minos/ {print $2; exit}')
+          echo "--- app minos: ${APP_MIN:-unknown} (project deployment target: 15.0) ---"
+          for FW in "$APP"/Frameworks/*.framework; do
+            [ -d "$FW" ] || continue
+            NAME=$(basename "$FW" .framework)
+            FW_MIN=$(xcrun vtool -show-build "$FW/$NAME" 2>/dev/null \
+                     | awk '/minos/ {print $2; exit}')
+            echo "--- $NAME minos: ${FW_MIN:-unknown} ---"
+            MAJOR=${FW_MIN%%.*}
+            if [ -n "$MAJOR" ] && [ "$MAJOR" -gt 15 ] 2>/dev/null; then
+              echo "::warning::$NAME is built for iOS $FW_MIN while the app targets 15.0 - dyld will refuse to load it on iOS 15"
+            fi
+          done
+          exit 0
+        basedOnDependencyAnalysis: false
